@@ -560,5 +560,390 @@ def home():
     </div>
     """
     return render_page(content, session["username"])
+@app.route("/train/<int:level>")
+def train(level):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    if level not in (1, 2, 3, 4):
+        return redirect(url_for("home"))
 
-@app.route("/train/<
+    task = generate_task(level)
+    # сохраняем текущее задание в сессии, чтобы проверить/сохранить при ответе
+    session["current_task"] = task
+
+    level_names = {1: "Новичок", 2: "Средний", 3: "Умеющий", 4: "Продвинутый"}
+
+    content = f"""
+    <div class="card">
+      <p><a href="/home" class="back-link">← На главную</a></p>
+      <h2>Уровень: {level_names[level]}</h2>
+      <div class="question-box">
+        {task['question']}
+      </div>
+      <div class="hint">Категория: {task['category']}</div>
+
+      <div id="answer_block" style="display:none;" class="answer-box">
+        <b>Разбор:</b><br>{task['answer']}
+      </div>
+
+      <div id="buttons_before">
+        <button class="btn btn-primary" onclick="showAnswer()">👁 Ответ / разбор</button>
+      </div>
+
+      <div id="buttons_after" style="display:none;">
+        <p class="hint">Вы выполнили задание правильно?</p>
+        <button class="btn btn-success" onclick="markResult(true)">✅ Правильно</button>
+        <button class="btn btn-danger" onclick="markResult(false)">❌ Неправильно</button>
+        <button class="btn btn-star" onclick="addFavorite()">⭐ В избранное</button>
+      </div>
+
+      <div id="next_block" style="display:none;margin-top:16px;">
+        <a href="/train/{level}" class="btn btn-primary">➡ Следующее задание</a>
+      </div>
+    </div>
+
+    <script>
+    function showAnswer() {{
+      document.getElementById('answer_block').style.display = 'block';
+      document.getElementById('buttons_before').style.display = 'none';
+      document.getElementById('buttons_after').style.display = 'block';
+    }}
+    function markResult(ok) {{
+      fetch('/mark_result', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{correct: ok}})
+      }}).then(() => {{
+        document.getElementById('buttons_after').style.display = 'none';
+        document.getElementById('next_block').style.display = 'block';
+      }});
+    }}
+    function addFavorite() {{
+      fetch('/add_favorite', {{method: 'POST'}})
+        .then(r => r.json())
+        .then(d => alert(d.message || 'Добавлено в избранное'));
+    }}
+    </script>
+    """
+    return render_page(content, session["username"])
+
+
+@app.route("/mark_result", methods=["POST"])
+def mark_result():
+    if "user_id" not in session or "current_task" not in session:
+        return jsonify({"ok": False}), 401
+    data = request.get_json()
+    correct = bool(data.get("correct"))
+    task = session["current_task"]
+    db = get_db()
+
+    if correct:
+        db.execute("UPDATE stats SET correct = correct + 1 WHERE user_id=?", (session["user_id"],))
+    else:
+        db.execute("UPDATE stats SET wrong = wrong + 1 WHERE user_id=?", (session["user_id"],))
+        # сохраняем ошибочное задание (без дублей)
+        db.execute("""INSERT OR IGNORE INTO wrong_tasks
+                      (user_id, task_key, category, question, answer)
+                      VALUES (?,?,?,?,?)""",
+                   (session["user_id"], task["key"], task["category"],
+                    task["question"], task["answer"]))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/add_favorite", methods=["POST"])
+def add_favorite():
+    if "user_id" not in session or "current_task" not in session:
+        return jsonify({"ok": False}), 401
+    task = session["current_task"]
+    db = get_db()
+    db.execute("""INSERT OR IGNORE INTO favorites
+                  (user_id, task_key, category, question, answer)
+                  VALUES (?,?,?,?,?)""",
+               (session["user_id"], task["key"], task["category"],
+                task["question"], task["answer"]))
+    db.commit()
+    return jsonify({"ok": True, "message": "⭐ Добавлено в избранное"})
+
+
+@app.route("/stats")
+def stats():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    db = get_db()
+    row = db.execute("SELECT * FROM stats WHERE user_id=?", (session["user_id"],)).fetchone()
+    correct = row["correct"] if row else 0
+    wrong = row["wrong"] if row else 0
+    total = correct + wrong
+
+    wrong_rows = db.execute(
+        "SELECT * FROM wrong_tasks WHERE user_id=? ORDER BY category", (session["user_id"],)
+    ).fetchall()
+
+    # группируем ошибки по категориям
+    folders = {}
+    for r in wrong_rows:
+        folders.setdefault(r["category"], []).append(r)
+
+    folders_html = ""
+    if not folders:
+        folders_html = '<p class="empty">Здесь пока ничего нет</p>'
+    else:
+        for cat, items in folders.items():
+            items_html = "".join(
+                f'<div class="task-item" onclick="this.classList.toggle(\'open\')">'
+                f'<div class="q">{it["question"]}</div>'
+                f'<div class="a"><b>Ответ:</b> {it["answer"]}</div>'
+                f'</div>'
+                for it in items
+            )
+            folders_html += f"""
+            <details class="folder">
+              <summary>📁 {cat} ({len(items)})</summary>
+              <div style="margin-top:10px;">{items_html}</div>
+            </details>
+            """
+
+    content = f"""
+    <div class="card">
+      <p><a href="/home" class="back-link">← На главную</a></p>
+      <h2>📊 Статистика</h2>
+      <div class="stats-grid">
+        <div style="text-align:center;">
+          <div class="stat-num" style="color:#34c759;">{correct}</div>
+          <div class="stat-label">Верных ответов</div>
+        </div>
+        <div style="text-align:center;">
+          <div class="stat-num" style="color:#e74c3c;">{wrong}</div>
+          <div class="stat-label">Неправильных</div>
+        </div>
+      </div>
+      <p class="hint">Всего решено: {total}</p>
+    </div>
+
+    <div class="card">
+      <h2>❌ Ошибочные задания</h2>
+      {folders_html}
+    </div>
+    """
+    return render_page(content, session["username"])
+
+
+@app.route("/favorites")
+def favorites():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM favorites WHERE user_id=? ORDER BY category", (session["user_id"],)
+    ).fetchall()
+
+    folders = {}
+    for r in rows:
+        folders.setdefault(r["category"], []).append(r)
+
+    folders_html = ""
+    if not folders:
+        folders_html = '<p class="empty">Здесь пока ничего нет</p>'
+    else:
+        for cat, items in folders.items():
+            items_html = "".join(
+                f'<div class="task-item" onclick="this.classList.toggle(\'open\')">'
+                f'<div class="q">{it["question"]}</div>'
+                f'<div class="a"><b>Ответ:</b> {it["answer"]}</div>'
+                f'</div>'
+                for it in items
+            )
+            folders_html += f"""
+            <details class="folder">
+              <summary>⭐ {cat} ({len(items)})</summary>
+              <div style="margin-top:10px;">{items_html}</div>
+            </details>
+            """
+
+    content = f"""
+    <div class="card">
+      <p><a href="/home" class="back-link">← На главную</a></p>
+      <h2>⭐ Избранное</h2>
+      {folders_html}
+    </div>
+    """
+    return render_page(content, session["username"])
+
+@app.route("/learn")
+def learn():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    content = """
+    <div class="card">
+      <p><a href="/home" class="back-link">← На главную</a></p>
+      <h2>📚 Обучение</h2>
+      <p class="hint">Теория и практика. Каждая тема подписана автором и названием источника.</p>
+
+      <details class="folder" open>
+        <summary>📖 Теория музыки</summary>
+        <div style="margin-top:12px;">
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Панова Н.В. — «Конспекты по элементарной теории музыки»</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Звук, свойства, знаки альтерации</b><br>
+                <span class="hint">Высота, длительность, тембр, громкость. Диез, бемоль, дубль-диез, дубль-бемоль, бекар. Энгармонизм.</span>
+              </div>
+              <div class="task-item">
+                <b>Нотная запись</b><br>
+                <span class="hint">Нота, нотоносец, штили, хвосты, добавочные линейки. Диапазон, регистр, ключи. Партитура.</span>
+              </div>
+              <div class="task-item">
+                <b>Ритм и метр</b><br>
+                <span class="hint">Основное деление длительностей. Ритм, метр, размер, такт, затакт. Пауза. Простые, сложные, смешанные размеры. Переменный метр. Темп.</span>
+              </div>
+              <div class="task-item" style="border-left:3px solid #f39c12; padding-left:10px;">
+                <b>⭐ Группировка длительностей</b><br>
+                <span class="hint">Подробно: группировка в размерах 2/4, 3/4, 4/4, 3/8, 6/8; вокальная группировка. Схемы дирижирования. Особые виды ритмического деления (триоли, квинтоли, секстоли, септоли, дуоли).</span>
+              </div>
+              <div class="task-item">
+                <b>Лад и тональность</b><br>
+                <span class="hint">Звукоряд, лад, гамма, тональность. Ладовое тяготение. Главные ступени. Мажор, минор и их виды. Количество гамм, энгармонизм тональностей. Параллельные, одноимённые, родственные тональности. Квинтовый круг.</span>
+              </div>
+              <div class="task-item">
+                <b>Хроматизм и альтерация</b><br>
+                <span class="hint">Хроматизм, альтерация, модуляция. Мажорная и минорная хроматическая гамма. Виды хроматических звуков. Лады народной музыки. Другие виды гамм. Транспозиция.</span>
+              </div>
+              <div class="task-item">
+                <b>Интервалы</b><br>
+                <span class="hint">Простые и составные интервалы. Две величины интервала. Консонансы и диссонансы. Обращение интервалов. Интервалы на ступенях натурального и гармонического мажора/минора. Диатонические и хроматические интервалы. Тритоны. Характерные интервалы. Энгармонизм интервалов.</span>
+              </div>
+              <div class="task-item">
+                <b>Аккорды</b><br>
+                <span class="hint">Виды аккордов. Трезвучия и их обращения. Главные и побочные трезвучия лада. Разрешение. Уменьшённые и увеличенные трезвучия. Четырёхзвучные аккорды. Септаккорд и его обращения. Типы септаккордов. D7, вводные, II7 с обращениями. Соединение аккордов в цепочки. Гармонические функции и обороты. Альтерация и энгармонизм аккордов.</span>
+              </div>
+              <div class="task-item">
+                <b>Музыкальная форма</b><br>
+                <span class="hint">Строение произведения, музыкальный синтаксис. Период. Куплетная форма. Простая двухчастная и трёхчастная. Вариации. Рондо. Сонатная форма. Циклические и полифонические формы.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Королёва С.Б. — «Я слышу, знаю и пою»</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Мнемотехника для запоминания</b><br>
+                <span class="hint">Стишки и рифмовки для запоминания нот, длительностей, интервалов, знаков альтерации, тональностей. Характеристика ступеней мажорного лада. Тритоны и характерные интервалы в стихах. Мелизмы, динамические оттенки, темпы — всё через образы и рифмы.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Римский-Корсаков В.С. — «Схемы и таблицы по теории музыки»</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Шпаргалки и таблицы</b><br>
+                <span class="hint">Краткий справочник: латинские названия нот и тональностей; виды мажора и минора; диатонические лады; тритоны (натуральные, гармонические, мелодические); характерные интервалы; разрешение тритонов и характерных интервалов от звука; ум.35 и ув.35 с обращениями; D7, VII7, II7 с обращениями; родственные тональности; хроматизмы; ладовые альтерации; золотой ход валторн; пассивный и активный энгармонизм; сонатная форма.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Ханова А.Б. — «Теория музыки в таблицах»</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Краткие таблицы-шпаргалки</b><br>
+                <span class="hint">Музыкальный язык; звук и его свойства; музыкальная система; знаки альтерации; слоговое и буквенное обозначение; ключи; лад и тональность; кварто-квинтовая система; особые диатонические лады; пентатоника; хроматизм; интервалы (простые, составные, консонансы/диссонансы); интервалы в тональности; характерные интервалы; аккорды (трезвучия, септаккорды, обращения); трезвучия в тональности; D7, VII7, II7 с обращениями и разрешением.</span>
+              </div>
+            </div>
+          </details>
+
+        </div>
+      </details>
+
+      <details class="folder">
+        <summary>🎼 Практика — гаммы, арпеджио, аккорды по нотам</summary>
+        <div style="margin-top:12px;">
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Ширинская Н. — «Гаммы и арпеджио для фортепиано» (1984)</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Подготовительные упражнения (№ 1–18)</b><br>
+                <span class="hint">Упражнения на legato, выравнивание пальцев, подкладывание первого пальца. Подготовка к гаммам двойными терциями.</span>
+              </div>
+              <div class="task-item">
+                <b>Мажорные гаммы</b><br>
+                <span class="hint">В октаву и в противоположном движении. В терцию, дециму и сексту. Двойными терциями. Все тональности (C, G, D, A, E, H, Fis, Ges, Des, As, Es, B, F).</span>
+              </div>
+              <div class="task-item">
+                <b>Минорные гаммы</b><br>
+                <span class="hint">Гармонические и мелодические. В октаву и в противоположном движении. В терцию, дециму и сексту. Двойными терциями. Все тональности (a, e, h, fis, cis, gis, dis, es, b, f, c, g, d).</span>
+              </div>
+              <div class="task-item">
+                <b>Хроматические гаммы</b><br>
+                <span class="hint">В октаву и в противоположном движении. В прямом и противоположном движении. В терцию, дециму и сексту. Двойными терциями.</span>
+              </div>
+              <div class="task-item">
+                <b>Арпеджио трезвучий</b><br>
+                <span class="hint">Мажорные и минорные трезвучия: короткие, ломаные, длинные. С обращениями (секстаккорд, квартсекстаккорд).</span>
+              </div>
+              <div class="task-item">
+                <b>Арпеджио септаккордов</b><br>
+                <span class="hint">Уменьшённые септаккорды: короткие, ломаные, длинные, с обращениями (квинтсекстаккорд, терцквартаккорд, секундаккорд). Доминантсептаккорды: короткие, ломаные, длинные, с обращениями.</span>
+              </div>
+              <div class="task-item">
+                <b>11 видов арпеджио от одного звука</b><br>
+                <span class="hint">Все виды арпеджио от звуков до, соль, ре, ля, ми, си, фа-диез, до-диез, соль-диез, ми-бемоль, си-бемоль, фа.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Флеш К. — «Гаммы и арпеджио для скрипки» (1962)</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>Гаммы и арпеджио для скрипки</b><br>
+                <span class="hint">Приложение к I части книги «Искусство скрипичной игры». Гаммы, арпеджио, упражнения для скрипки по тональностям.</span>
+              </div>
+            </div>
+          </details>
+
+          <details class="folder" style="margin-left:12px;">
+            <summary>Чайковский П.И. — «Детский альбом» (произведения для игры)</summary>
+            <div style="margin-top:8px;">
+              <div class="task-item">
+                <b>24 пьесы</b><br>
+                <span class="hint">Утреннее размышление · Зимнее утро · Игра в лошадки · Мама · Марш деревянных солдатиков · Болезнь куклы · Похороны куклы · Вальс · Новая кукла · Мазурка · Русская песня · Мужик на гармонике играет · Камаринская · Полька · Итальянская песенка · Старинная французская песенка · Немецкая песенка · Неаполитанская песенка · Нянина сказка · Баба-яга · Сладкая грёза · Песня жаворонка · Шарманщик поёт · Хор.</span>
+              </div>
+            </div>
+          </details>
+
+        </div>
+      </details>
+
+      <details class="folder">
+        <summary>🔗 Полезные внешние материалы</summary>
+        <div style="margin-top:8px;">
+          <div class="task-item">
+            <b>Цифровая библиотека ДШИ им. Балакирева (Нижний Новгород)</b><br>
+            <span class="hint">Теория и практика с нуля по классам музыкальной школы.</span><br>
+            <a href="https://dshish.nnov.muzkult.ru/Digitallibrary" target="_blank" class="back-link">Перейти →</a>
+          </div>
+          <div class="task-item">
+            <b>Библиотека МСЦ1 — пособия для скрипки</b><br>
+            <span class="hint">Для скрипки: пособия по теории и произведения для игры в зависимости от уровня.</span><br>
+            <a href="https://msc1.ru/biblioteka/noty-dlja-strunno-smychkovyh-instrumentov/noty-dlja-skripki/posobija-dlja-nachinajushhih-dlja-skripki/" target="_blank" class="back-link">Перейти →</a>
+          </div>
+        </div>
+      </details>
+
+    </div>
+    """
+    return render_page(content, session["username"])
+
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
